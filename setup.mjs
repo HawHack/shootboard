@@ -1,0 +1,12 @@
+import { randomBytes, scryptSync } from 'node:crypto';
+import { existsSync, writeFileSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
+if(existsSync('.env')) throw Error('.env уже существует. Сохраните его перед повторной настройкой.');
+const rl=createInterface({input:process.stdin,output:process.stdout});
+console.log('Создание единственного администратора. Пароль вводится видимым текстом в этом терминале.');
+const password=await rl.question('Пароль (не менее 14 символов): '); rl.close();
+if(password.length<14) throw Error('Нужно не менее 14 символов');
+const salt=randomBytes(16).toString('hex');
+const hash=salt+':'+scryptSync(password,salt,64).toString('hex');
+writeFileSync('.env',`APP_ORIGIN=http://localhost:4318\nHOST=127.0.0.1\nPORT=4318\nADMIN_PASSWORD_HASH=${hash}\nDATA_KEY=${randomBytes(32).toString('hex')}\nGOOGLE_CLIENT_ID=\nGOOGLE_CLIENT_SECRET=\n`,{mode:0o600,flag:'wx'});
+console.log('Готово. npm start. Для команды задайте HTTPS-адрес в APP_ORIGIN и настройте обратный прокси.');
