@@ -84,7 +84,7 @@ export function createApp(config={}){
  const json=(obj,status=200)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(obj))};
  const redirect=location=>{res.writeHead(303,{Location:location});res.end()};
  try{
- if(!path.startsWith('/api/')){const files={'/':'index.html','/app.js':'app.js','/calendar.js':'calendar.js','/cards.js':'cards.js','/deadlines.js':'deadlines.js','/team-ui.js':'team-ui.js','/sw.js':'sw.js','/style.css':'style.css','/access':'access.html','/access.js':'access.js'};if(!files[path])fail(404,'Не найдено');res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript; charset=utf-8':path.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8');res.end(readFileSync(join(root,'public',files[path])));return}
+ if(!path.startsWith('/api/')){const files={'/':'index.html','/app.js':'app.js','/calendar.js':'calendar.js','/cards.js':'cards.js','/deadlines.js':'deadlines.js','/task-agenda.js':'task-agenda.js','/team-ui.js':'team-ui.js','/sw.js':'sw.js','/style.css':'style.css','/access':'access.html','/access.js':'access.js'};if(!files[path])fail(404,'Не найдено');res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript; charset=utf-8':path.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8');res.end(readFileSync(join(root,'public',files[path])));return}
  if(!['GET','HEAD'].includes(req.method)&&req.headers.origin!==origin)fail(403,'Недопустимый источник запроса');
  const s=session(req);
  if(path==='/api/login'&&req.method==='POST'){
