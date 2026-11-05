@@ -12,6 +12,7 @@ test('admin applies template with owners atomically, remembers defaults, and doe
  const login=await call('login','POST',{password});headers.Cookie=login.cookie.split(';')[0];const state=(await call('state')).data;headers['X-CSRF-Token']=state.csrf;
  const employee=(await call('employees','POST',{name:'Анна'})).data;
  const event=(await call('events','POST',{title:'Кубок',start:'2026-11-01T03:00:00Z',end:'2026-11-01T12:00:00Z'})).data;
+ await call('events/'+event.id+'/template','POST',{items:state.settings.template.map(title=>({title}))});
  const title=state.settings.template[0];const original=a.db.prepare('SELECT * FROM tasks WHERE event_id=? AND title=?').get(event.id,title);
  a.db.prepare('UPDATE tasks SET done=1,deadline=? WHERE id=?').run('2026-10-30',original.id);
  const b={items:[{title,employee_id:employee.id}],remember:true};
@@ -30,3 +31,4 @@ test('admin applies template with owners atomically, remembers defaults, and doe
  assert.equal((await call('events/imported/template','POST',b,eh)).status,403);assert.equal(es.settings,undefined);
  }finally{a.close()}
 });
+

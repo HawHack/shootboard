@@ -1,4 +1,7 @@
 import http from 'node:http';
+import {validZone} from './public/deadlines.js';
+import {installTeam} from './team.mjs';
+import {dirname as pathDirname} from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, createHash, scrypt, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -35,6 +38,7 @@ export function createApp(config={}){
  if(!get('dateModelV2')){run('DELETE FROM settings WHERE key=?','syncToken');set('dateModelV2','1');}
  if(!get('template')) set('template',JSON.stringify(defaults));
  function transaction(fn){db.exec('BEGIN IMMEDIATE'); try{const r=fn();db.exec('COMMIT');return r}catch(e){db.exec('ROLLBACK');throw e}}
+ const team=installTeam({db,q,one,run,get,set,transaction,root,uploadDir:config.uploadDir||(dataPath!==':memory:'?join(pathDirname(dataPath),'uploads'):undefined),config});
  function seal(value){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key,iv); const body=Buffer.concat([c.update(JSON.stringify(value)),c.final()]);return Buffer.concat([iv,c.getAuthTag(),body]).toString('base64')}
  function unseal(value){const b=Buffer.from(value,'base64'),d=createDecipheriv('aes-256-gcm',key,b.subarray(0,12));d.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([d.update(b.subarray(28)),d.final()]).toString())}
  function session(req){const raw=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('__Host-shootboard='))?.split('=')[1]; if(!raw)return null;
@@ -60,13 +64,14 @@ export function createApp(config={}){
  let syncToken=get('syncToken'),page,received=[],next;
  for(let reset=0;reset<2;reset++){
  try{do{const p=new URLSearchParams({singleEvents:'true',showDeleted:'true',maxResults:'2500'});if(syncToken)p.set('syncToken',syncToken);if(page)p.set('pageToken',page);
- const r=await google(path+'?'+p);received.push(...(r.items||[]));page=r.nextPageToken;next=r.nextSyncToken;}while(page);break;
+ const r=await google(path+'?'+p);received.push(...(r.items||[]).map(e=>({...e,_calendarTimezone:r.timeZone})));page=r.nextPageToken;next=r.nextSyncToken;}while(page);break;
  }catch(err){if(err.googleStatus===410&&reset===0){syncToken=null;page=null;received=[];continue}throw err}}
  transaction(()=>{for(const e of received){const old=one('SELECT * FROM events WHERE calendar_id=? AND google_id=?',cal,e.id);
  if(e.status==='cancelled'){if(old)run('UPDATE events SET cancelled=1,etag=? WHERE id=?',e.etag||'',old.id);continue}
  const start=e.start?.dateTime||e.start?.date,end=e.end?.dateTime||e.end?.date,allDay=Number(!!e.start?.date);if(!start||!end)continue;
  if(old)run('UPDATE events SET title=?,start=?,end=?,location=?,description=?,cancelled=0,etag=?,dirty=0,conflict=0,all_day=? WHERE id=?',e.summary||'Без названия',start,end,e.location||'',e.description||'',e.etag,allDay,old.id);
  else run('INSERT INTO events(id,title,start,end,location,description,calendar_id,google_id,etag,all_day) VALUES(?,?,?,?,?,?,?,?,?,?)',token(),e.summary||'Без названия',start,end,e.location||'',e.description||'',cal,e.id,e.etag,allDay);
+ run('UPDATE events SET timezone=? WHERE calendar_id=? AND google_id=?',validZone(e.start?.timeZone||e._calendarTimezone),cal,e.id);
  }if(next)set('syncToken',next);set('lastSync',new Date().toISOString());set('syncError','')});
  }catch(err){set('syncError',err.message);throw err}}
  const sync=()=>syncing|| (syncing=doSync().finally(()=>{syncing=null}));
@@ -79,7 +84,7 @@ export function createApp(config={}){
  const json=(obj,status=200)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(obj))};
  const redirect=location=>{res.writeHead(303,{Location:location});res.end()};
  try{
- if(!path.startsWith('/api/')){const files={'/':'index.html','/app.js':'app.js','/calendar.js':'calendar.js','/cards.js':'cards.js','/style.css':'style.css','/access':'access.html','/access.js':'access.js'};if(!files[path])fail(404,'Не найдено');res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript; charset=utf-8':path.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8');res.end(readFileSync(join(root,'public',files[path])));return}
+ if(!path.startsWith('/api/')){const files={'/':'index.html','/app.js':'app.js','/calendar.js':'calendar.js','/cards.js':'cards.js','/deadlines.js':'deadlines.js','/team-ui.js':'team-ui.js','/sw.js':'sw.js','/style.css':'style.css','/access':'access.html','/access.js':'access.js'};if(!files[path])fail(404,'Не найдено');res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript; charset=utf-8':path.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8');res.end(readFileSync(join(root,'public',files[path])));return}
  if(!['GET','HEAD'].includes(req.method)&&req.headers.origin!==origin)fail(403,'Недопустимый источник запроса');
  const s=session(req);
  if(path==='/api/login'&&req.method==='POST'){
@@ -91,43 +96,33 @@ export function createApp(config={}){
  const e=one('SELECT * FROM employees WHERE token_hash=?',hash(b.token));if(!e)fail(401,'Ссылка недействительна или отозвана');if(s)run('DELETE FROM sessions WHERE hash=?',s.hash);const n=newSession(e);res.setHeader('Set-Cookie',cookie(n.raw,n.age));return json({ok:true});}
  if(!s)fail(401,'Войдите или откройте персональную ссылку');
  if(!['GET','HEAD'].includes(req.method)&&req.headers['x-csrf-token']!==s.csrf)fail(403,'Сессия устарела. Обновите страницу');
- if(path==='/api/logout'&&req.method==='POST'){run('DELETE FROM sessions WHERE hash=?',s.hash);res.setHeader('Set-Cookie',cookie('',0));return json({ok:true})}
+ if(path==='/api/logout'&&req.method==='POST'){team.logout(s);run('DELETE FROM sessions WHERE hash=?',s.hash);res.setHeader('Set-Cookie',cookie('',0));return json({ok:true})}
  if(path==='/api/state'&&req.method==='GET'){
- const state={me:{id:s.employee_id,name:s.admin?'Администратор':s.name,admin:s.admin},csrf:s.csrf,events:q('SELECT '+(s.admin?'*':'id,title,start,end,location,description,cancelled,calendar_id,all_day')+' FROM events ORDER BY start'),employees:q('SELECT id,name FROM employees ORDER BY name'),assignments:q('SELECT * FROM assignments'),tasks:q('SELECT * FROM tasks')};
+ const state={me:{id:s.employee_id,name:s.admin?'Администратор':s.name,admin:s.admin},csrf:s.csrf,events:q('SELECT '+(s.admin?'*':'id,title,start,end,location,description,cancelled,calendar_id,all_day,timezone')+' FROM events ORDER BY start'),employees:q('SELECT id,name FROM employees ORDER BY name'),assignments:q('SELECT * FROM assignments'),tasks:q('SELECT * FROM tasks')};
  const visible=new Set(state.events.filter(e=>!e.calendar_id||e.calendar_id===get('calendar')).map(e=>e.id));state.events=state.events.filter(e=>visible.has(e.id));state.tasks=state.tasks.filter(t=>visible.has(t.event_id));state.assignments=state.assignments.filter(a=>visible.has(a.event_id));if(!s.admin)state.events=state.events.map(({calendar_id,...e})=>e);
- if(s.admin)state.settings={template:JSON.parse(get('template')),templateOwners:JSON.parse(get('templateOwners')||'{}'),googleConnected:!!get('google'),googleConfigured:!!(process.env.GOOGLE_CLIENT_ID&&process.env.GOOGLE_CLIENT_SECRET),calendar:get('calendar')||'',lastSync:get('lastSync')||null,syncError:get('syncError')||'',links:q('SELECT id,token_hash IS NOT NULL AS active FROM employees')};return json(state)}
+ if(s.admin)state.settings={template:JSON.parse(get('template')),templateOwners:JSON.parse(get('templateOwners')||'{}'),templateKinds:JSON.parse(get('templateKinds')||'{}'),googleConnected:!!get('google'),googleConfigured:!!(process.env.GOOGLE_CLIENT_ID&&process.env.GOOGLE_CLIENT_SECRET),calendar:get('calendar')||'',lastSync:get('lastSync')||null,syncError:get('syncError')||'',links:q('SELECT id,token_hash IS NOT NULL AS active FROM employees')};return json(state)}
+ if(await team.routes({req,res,url,path,s,json,body,limited}))return;
  const taskMatch=path.match(/^\/api\/tasks\/([^/]+)\/status$/);
  if(taskMatch&&req.method==='PATCH'){
  const b=await body(req);if(typeof b.done!=='boolean'||!Number.isInteger(b.revision))fail(400,'Неверный статус');
- transaction(()=>{const t=one('SELECT * FROM tasks WHERE id=?',taskMatch[1]);if(!t)fail(404,'Задача не найдена');if(!s.admin&&t.employee_id!==s.employee_id)fail(403,'Можно менять только свои задачи');if(t.revision!==b.revision)fail(409,'Задача уже изменена. Данные обновлены.');
- if(t.done===Number(b.done))return;run('UPDATE tasks SET done=?,revision=revision+1 WHERE id=?',Number(b.done),t.id);run('INSERT INTO audit(task_id,event_id,task_title,actor_id,actor_name,done,at) VALUES(?,?,?,?,?,?,?)',t.id,t.event_id,t.title,s.employee_id,s.admin?'Администратор':s.name,Number(b.done),new Date().toISOString())});return json({ok:true})}
+ transaction(()=>{const t=one('SELECT * FROM tasks WHERE id=?',taskMatch[1]);if(!t)fail(404,'Задача не найдена');team.requireEvent(t.event_id);if(!s.admin&&t.employee_id!==s.employee_id)fail(403,'Можно менять только свои задачи');if(t.revision!==b.revision)fail(409,'Задача уже изменена. Данные обновлены.');
+ if(t.done===Number(b.done))return;run('UPDATE tasks SET done=?,revision=revision+1 WHERE id=?',Number(b.done),t.id);run('INSERT INTO audit(task_id,event_id,task_title,actor_id,actor_name,done,at) VALUES(?,?,?,?,?,?,?)',t.id,t.event_id,t.title,s.employee_id,s.admin?'Администратор':s.name,Number(b.done),new Date().toISOString());if(b.done)team.completed(t,s)});void team.drain().catch(()=>{});return json({ok:true})}
  if(!s.admin)fail(403,'Доступно только администратору');
  if(path==='/api/employees'&&req.method==='POST'){const b=await body(req),id=token(),raw=token();run('INSERT INTO employees(id,name,token_hash) VALUES(?,?,?)',id,str(b.name,80),hash(raw));return json({id,link:origin+'/access#'+raw})}
  const emp=path.match(/^\/api\/employees\/([^/]+)\/(rotate|revoke)$/);
  if(emp&&req.method==='POST'){const e=one('SELECT * FROM employees WHERE id=?',emp[1]);if(!e)fail(404,'Сотрудник не найден');const raw=emp[2]==='rotate'?token():null;
- transaction(()=>{run('UPDATE employees SET token_hash=?,version=version+1 WHERE id=?',raw?hash(raw):null,e.id);run('DELETE FROM sessions WHERE employee_id=?',e.id)});return json({link:raw?origin+'/access#'+raw:null})}
- if(path==='/api/template'&&req.method==='PUT'){const b=await body(req);if(!Array.isArray(b.items)||b.items.length>30)fail(400,'Не более 30 задач');set('template',JSON.stringify(b.items.map(t=>str(t))));return json({ok:true})}
+ transaction(()=>{run('UPDATE employees SET token_hash=?,version=version+1 WHERE id=?',raw?hash(raw):null,e.id);run('DELETE FROM sessions WHERE employee_id=?',e.id);team.revoke(e.id)});return json({link:raw?origin+'/access#'+raw:null})}
+ if(path==='/api/template'&&req.method==='PUT'){const b=await body(req);team.setTemplate(b.items,b.kinds);return json({ok:true})}
  const applyTemplate=path.match(/^\/api\/events\/([^/]+)\/template$/);
- if(applyTemplate&&req.method==='POST'){
- const b=await body(req),eventId=applyTemplate[1];
- if(!one('SELECT id FROM events WHERE id=?',eventId))fail(404,'Съёмка не найдена');
- if(!Array.isArray(b.items)||!b.items.length||b.items.length>30)fail(400,'Выберите от 1 до 30 задач');
- const titles=new Set(JSON.parse(get('template'))),seen=new Set();
- const items=b.items.map(item=>{const title=str(item.title),employee_id=validEmployee(item.employee_id);if(!titles.has(title))fail(409,'Шаблон изменился. Откройте его заново.');if(seen.has(title.toLocaleLowerCase('ru')))fail(400,'Задачи в шаблоне не должны повторяться');seen.add(title.toLocaleLowerCase('ru'));return {title,employee_id}});
- let added=0,assigned=0;
- transaction(()=>{for(const item of items){const existing=q('SELECT * FROM tasks WHERE event_id=?',eventId).find(t=>t.title.trim().toLocaleLowerCase('ru')===item.title.toLocaleLowerCase('ru'));
- if(existing){if(existing.employee_id!==item.employee_id){run('UPDATE tasks SET employee_id=?,revision=revision+1 WHERE id=?',item.employee_id,existing.id);assigned++}}
- else{run('INSERT INTO tasks(id,event_id,title,employee_id) VALUES(?,?,?,?)',token(),eventId,item.title,item.employee_id);added++}}
- if(b.remember===true){const owners=JSON.parse(get('templateOwners')||'{}');set('templateOwners',JSON.stringify(Object.fromEntries([...Object.entries(owners).filter(([title])=>!items.some(i=>i.title===title)),...items.map(i=>[i.title,i.employee_id])])))}
- });return json({added,assigned});}
- if(path==='/api/events'&&req.method==='POST'){const b=await body(req),v=eventFields(b),id=token();transaction(()=>{run('INSERT INTO events(id,title,start,end,location,description,dirty) VALUES(?,?,?,?,?,?,1)',id,...v);for(const title of JSON.parse(get('template')))run('INSERT INTO tasks(id,event_id,title) VALUES(?,?,?)',token(),id,title)});return json({id})}
+ if(applyTemplate&&req.method==='POST'){const b=await body(req);return json(team.applyTemplate(applyTemplate[1],b,validEmployee));}
+ if(path==='/api/events'&&req.method==='POST'){const b=await body(req),v=eventFields(b),id=token();transaction(()=>{run('INSERT INTO events(id,title,start,end,location,description,dirty) VALUES(?,?,?,?,?,?,1)',id,...v)});return json({id})}
  const ev=path.match(/^\/api\/events\/([^/]+)$/);
  if(ev&&req.method==='PUT'){const b=await body(req),v=eventFields(b);const existing=one('SELECT * FROM events WHERE id=?',ev[1]);if(!existing)fail(404,'Съёмка не найдена');if(existing.google_id)fail(403,'Это событие доступно только для чтения. Изменяйте его в Google Calendar.');run('UPDATE events SET title=?,start=?,end=?,location=?,description=?,dirty=1,revision=revision+1 WHERE id=?',...v,ev[1]);return json({ok:true})}
  const assign=path.match(/^\/api\/events\/([^/]+)\/assignments$/);
  if(assign&&req.method==='PUT'){const b=await body(req);if(!Array.isArray(b.items)||b.items.length>20)fail(400,'Проверьте команду');transaction(()=>{run('DELETE FROM assignments WHERE event_id=?',assign[1]);for(const a of b.items)run('INSERT INTO assignments VALUES(?,?,?)',assign[1],validEmployee(str(a.employee_id)),str(a.role,80))});return json({ok:true})}
- if(path==='/api/tasks'&&req.method==='POST'){const b=await body(req);run('INSERT INTO tasks(id,event_id,title,employee_id,deadline) VALUES(?,?,?,?,?)',token(),str(b.event_id),str(b.title),validEmployee(b.employee_id),b.deadline?str(b.deadline,30):null);return json({ok:true})}
+ if(path==='/api/tasks'&&req.method==='POST'){const b=await body(req);const event=team.requireEvent(b.event_id);team.validateDeadline(b.deadline);run('INSERT INTO tasks(id,event_id,title,employee_id,deadline,timezone) VALUES(?,?,?,?,?,?)',token(),str(b.event_id),str(b.title),validEmployee(b.employee_id),b.deadline?str(b.deadline,30):null,event.timezone);return json({ok:true})}
  const tm=path.match(/^\/api\/tasks\/([^/]+)$/);
- if(tm&&req.method==='PUT'){const b=await body(req);run('UPDATE tasks SET title=?,employee_id=?,deadline=?,revision=revision+1 WHERE id=?',str(b.title),validEmployee(b.employee_id),b.deadline?str(b.deadline,30):null,tm[1]);return json({ok:true})}
+ if(tm&&req.method==='PUT'){const b=await body(req);const task=one('SELECT * FROM tasks WHERE id=?',tm[1]);if(!task)fail(404,'Задача не найдена');team.requireEvent(task.event_id);team.validateDeadline(b.deadline);run("UPDATE tasks SET title=?,employee_id=?,deadline=?,deadline_mode='manual',revision=revision+1 WHERE id=?",str(b.title),validEmployee(b.employee_id),b.deadline?str(b.deadline,30):null,tm[1]);return json({ok:true})}
  if(tm&&req.method==='DELETE'){run('DELETE FROM tasks WHERE id=?',tm[1]);return json({ok:true})}
  if(path==='/api/audit'&&req.method==='GET')return json(q('SELECT * FROM audit ORDER BY id DESC LIMIT 300'));
  if(path==='/api/demo'&&req.method==='POST'){if(one('SELECT id FROM events LIMIT 1'))fail(409,'Пример можно добавить только в пустое расписание');transaction(()=>{const names=['Андрей','Максим','Анна','Мария','Илья','Ольга','Денис','София'];for(const name of names)run('INSERT INTO employees(id,name) VALUES(?,?)',token(),name);const team=q('SELECT id FROM employees');for(let i=0;i<3;i++){const id=token(),d=new Date();d.setUTCDate(d.getUTCDate()+2+i*5);d.setUTCHours(3,0,0,0);run('INSERT INTO events(id,title,start,end,location,description) VALUES(?,?,?,?,?,?)',id,['Осенняя грация','Кубок Сибири','Первые звёзды'][i],d.toISOString(),new Date(+d+8*3600000).toISOString(),['Центр гимнастики','Арена «Север»','Спортивный комплекс'][i],'Тестовая съёмка. Можно отредактировать.');run('INSERT INTO assignments VALUES(?,?,?)',id,team[i].id,'Фотограф');for(const title of defaults)run('INSERT INTO tasks(id,event_id,title,employee_id) VALUES(?,?,?,?)',token(),id,title,team[i].id)}});return json({ok:true})}
@@ -141,9 +136,10 @@ export function createApp(config={}){
  if(path==='/api/google/calendar'&&req.method==='PUT'){if(syncing)fail(409,'Дождитесь синхронизации');const b=await body(req),id=str(b.id,500);if(get('calendar')!==id){run('DELETE FROM settings WHERE key IN (?,?,?)','syncToken','lastSync','syncError');}set('calendar',id);return json({ok:true})}
  if(path==='/api/google/sync'&&req.method==='POST'){await sync();return json({ok:true})}
  fail(404,'Не найдено');
- }catch(e){json({error:e.code&&e.code<500?e.message:e.code===502?e.message:'Не удалось выполнить действие'},e.code||500)}
+ }catch(e){const status=Number.isInteger(e.code)&&e.code>=400&&e.code<=599?e.code:500;if(status===500)console.error('ShootBoard request failed:',e.message);json({error:status<500||status===502?e.message:'Не удалось выполнить действие'},status)}
  });
- return {server,db,sync,close:()=>{clearInterval(timer);server.close();db.close()}};
+ return {server,db,sync,flushPush:team.drain,close:()=>{team.close();clearInterval(timer);server.close();db.close()}};
 }
 if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createApp();app.server.listen(Number(process.env.PORT||4318),process.env.HOST||'127.0.0.1',()=>console.log('ShootBoard: '+(process.env.APP_ORIGIN||'http://localhost:4318')))}
+
 
